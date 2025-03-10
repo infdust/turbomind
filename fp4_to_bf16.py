@@ -2,41 +2,11 @@ import torch
 import torch.nn as nn
 from safetensors import safe_open
 
-import turbomind as tm
-from turbomind.utils import unpack_awq_gemm
-
 torch.manual_seed(0)
-
-# def dequantize(qweight, qzeros, scales, group_size: int = 128):
-#     _qweight = unpack_awq_gemm(qweight)
-#     _qzeros = unpack_awq_gemm(qzeros)
-#     _qzeros = _qzeros.float()
-#     _qweight = _qweight.float()
-#     _scales = scales.float()
-#     for i in range(qzeros.shape[0]):
-#         start = i * group_size
-#         end = start + group_size
-#         _qweight[start:end] = (_qweight[start:end, :] -
-#                                _qzeros[i:i + 1, :]) * _scales[i:i + 1, :]
-#     return _qweight.half()
-
-# def load_specified_linear_weights(path):
-#     ckpt_path = path  # noqa
-#     layer_id = 0
-#     # prefix = f'model.layers.{layer_id}.self_attn.q_proj.'
-#     prefix = f'model.layers.{layer_id}.mlp.down_proj.'
-#     keys = ['qweight', 'qzeros', 'scales']
-#     tensors = {}
-#     with safe_open(ckpt_path, framework='pt', device='cuda:2') as f:
-#         for key in keys:
-#             tensors[key] = f.get_tensor(prefix + key)
-
-#     return tensors['qweight'], tensors['qzeros'], tensors['scales']
 
 def load_specified_linear_weights():
     ckpt_path = 'model-00001-of-000163.safetensors'  # noqa
     layer_id = 0
-    # prefix = f'model.layers.{layer_id}.self_attn.q_proj.'
     prefix = f'model.layers.{layer_id}.mlp.down_proj.'
     keys = ['weight', 'weight_scale_inv']
     tensors = {}
@@ -47,10 +17,9 @@ def load_specified_linear_weights():
     return tensors['weight'], tensors['weight_scale_inv']
 
 def dequantize_weights_torch(quantized_weights: torch.Tensor, scale_matrix: torch.Tensor) -> torch.Tensor:
-    # 确认尺寸匹配
     H, W = quantized_weights.shape
-    assert H % 128 == 0 and W % 128 == 0, "权重矩阵尺寸必须是 128 的倍数"
-    assert scale_matrix.shape == (H // 128, W // 128), "scale 矩阵尺寸不匹配"
+    assert H % 128 == 0 and W % 128 == 0
+    assert scale_matrix.shape == (H // 128, W // 128)
     scale_expanded = torch.kron(
         scale_matrix,
         torch.ones((128, 128), dtype=scale_matrix.dtype, device=scale_matrix.device)
@@ -60,9 +29,7 @@ def dequantize_weights_torch(quantized_weights: torch.Tensor, scale_matrix: torc
     return dequantized.half()
 
 weight, weight_scale = load_specified_linear_weights()
-# print(weight, weight_scale)
-dequant_weight = dequantize_weights_torch(weight, weight_scale)
-# print(dequant_weight, dequant_weight.shape)
+weight_ref = dequantize_weights_torch(weight, weight_scale)
 
 
 # group_size_awq = 64
@@ -70,22 +37,22 @@ batch_size = 16384
 
 # qweight_ref, qzeros_ref, scales_ref = load_specified_linear_weights('/root/turbomind/model-00001-of-00074.safetensors')
 # 18432
-in_features = dequant_weight.shape[1]
+in_features = weight_ref.shape[1]
 # 7168
-out_features = dequant_weight.shape[0]
+out_features = weight_ref.shape[0]
 
 x = torch.randn((batch_size, in_features),
-                device=dequant_weight.device,
+                device=weight_ref.device,
                 dtype=torch.float16) * 0.1
 
 # weight_awq = dequantize(qweight_ref, qzeros_ref, scales_ref, group_size_awq)
-print(f'-- dequantization: weight_awq.shape={dequant_weight.shape}, weight_awq: \n{dequant_weight}')
-awq_linear = nn.Linear(in_features, out_features, bias=False, device='cuda:2')
+print(f'-- dequantization: weight_ref.shape={weight_ref.shape}, weight_ref: \n{weight_ref}')
+linear_ref = nn.Linear(in_features, out_features, bias=False, device='cuda:2')
 with torch.no_grad():
-    awq_linear.weight = nn.Parameter(dequant_weight)
-    awq_res = awq_linear(x)
-    print(awq_linear.weight.shape)
-    print(f'nn.linear.awq_res: {awq_res}, {awq_res.shape}')
+    linear_ref.weight = nn.Parameter(weight_ref)
+    res_ref = linear_ref(x)
+    print(linear_ref.weight.shape)
+    print(f'nn.linear.ref_res: {res_ref}, {res_ref.shape}')
 
 
 def load_weight(path):
@@ -97,11 +64,8 @@ def load_weight(path):
             'weight_scale', 
             'weight_scale_2']
     tensors = {}
-    # 使用 safe_open 打开文件
+
     with safe_open(file_path, framework="pt", device="cuda:2") as f:
-        # 获取所有键
-        # keys = f.keys()
-        # print("Keys in the safetensors file:", keys)
         for key in keys:
             tensor = f.get_tensor(prefix + key)
             tensors[key] = tensor
@@ -142,9 +106,6 @@ def unpack_uint8_to_fp4(x: torch.Tensor) -> torch.Tensor:
 
 
 def dequantize_w(w, w_block_scale, w_global_scale, group_size):
-    # weight = tensors['weight']
-    # weight_scale = tensors['weight_scale']
-    # weight_scale_2 = tensors['weight_scale_2']
 
     w = unpack_uint8_to_fp4(w)
     w = w.float()
@@ -161,10 +122,6 @@ def dequantize_w(w, w_block_scale, w_global_scale, group_size):
     return w.half()
 
 def dequantize_x(x, x_block_scale, x_global_scale, group_size):
-    # weight = tensors['weight']
-    # weight_scale = tensors['weight_scale']
-    # weight_scale_2 = tensors['weight_scale_2']
-
     # x = unpack_uint8_to_fp4(x)
     # x = x.float()
     x_block_scale = x_block_scale.float()
@@ -222,7 +179,6 @@ def quantize_to_fp4_e2m1(x : torch.Tensor, x_global_scale, group_size):
     return x_fp4, x_block_scale
 
 
-
 tensors = load_weight('/root/turbomind/model-00001-of-00080.safetensors')
 input_global_scale = tensors['input_scale']
 weight_fp4 = tensors['weight']
@@ -233,7 +189,6 @@ group_size = 16
 batch_size = 16384
 # 7186
 in_features = tensors['weight'].shape[0]
-
 # 18432
 out_features = tensors['weight'].shape[1]*2
 
@@ -256,14 +211,16 @@ with torch.no_grad():
     print(f'nn.linear.res: {fp4_res}, {fp4_res.shape}')
 
 
-abs_diff = torch.abs(fp4_res - awq_res).float()
-rel_diff = abs_diff / torch.max(torch.abs(awq_res), torch.abs(fp4_res))
+abs_diff = torch.abs(fp4_res - res_ref).float()
+rel_diff = abs_diff / torch.max(torch.abs(res_ref), torch.abs(fp4_res))
 rtol = 0.01
 atol = 0.0001
-outliers = abs_diff > atol + rtol * torch.abs(awq_res)
+outliers = abs_diff > atol + rtol * torch.abs(res_ref)
 abs_diff = torch.sum(abs_diff) / abs_diff.numel()
 rel_diff = torch.sum(rel_diff) / rel_diff.numel()
 outliers = torch.sum(outliers) / outliers.shape[0]
 print(f'abs_diff {abs_diff:4f}, '
       f'rel_diff {rel_diff:4f}, '
       f'outliers {outliers:4f}')
+
+# abs_diff 0.004328, rel_diff 0.239396, outliers 6722.556641
