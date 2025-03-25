@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 from safetensors import safe_open
+import tensorrt_llm
+import unittest
+from parameterized import parameterized
 
 torch.manual_seed(0)
 
@@ -10,7 +13,7 @@ def load_specified_linear_weights():
     prefix = f'model.layers.{layer_id}.mlp.down_proj.'
     keys = ['weight', 'weight_scale_inv']
     tensors = {}
-    with safe_open(ckpt_path, framework='pt', device='cuda:2') as f:
+    with safe_open(ckpt_path, framework='pt', device='cuda:0') as f:
         for key in keys:
             tensors[key] = f.get_tensor(prefix + key)
 
@@ -28,31 +31,31 @@ def dequantize_weights_torch(quantized_weights: torch.Tensor, scale_matrix: torc
     dequantized = quantized_weights.float() * scale_expanded.float()
     return dequantized.half()
 
-weight, weight_scale = load_specified_linear_weights()
-weight_ref = dequantize_weights_torch(weight, weight_scale)
+# weight, weight_scale = load_specified_linear_weights()
+# weight_ref = dequantize_weights_torch(weight, weight_scale)
 
 
-# group_size_awq = 64
-batch_size = 16384
+# # group_size_awq = 64
+# batch_size = 16384
 
-# qweight_ref, qzeros_ref, scales_ref = load_specified_linear_weights('/root/turbomind/model-00001-of-00074.safetensors')
-# 18432
-in_features = weight_ref.shape[1]
-# 7168
-out_features = weight_ref.shape[0]
+# # qweight_ref, qzeros_ref, scales_ref = load_specified_linear_weights('/root/turbomind/model-00001-of-00074.safetensors')
+# # 18432
+# in_features = weight_ref.shape[1]
+# # 7168
+# out_features = weight_ref.shape[0]
 
-x = torch.randn((batch_size, in_features),
-                device=weight_ref.device,
-                dtype=torch.float16) * 0.1
+# x = torch.randn((batch_size, in_features),
+#                 device=weight_ref.device,
+#                 dtype=torch.float16) * 0.1
 
-# weight_awq = dequantize(qweight_ref, qzeros_ref, scales_ref, group_size_awq)
-print(f'-- dequantization: weight_ref.shape={weight_ref.shape}, weight_ref: \n{weight_ref}')
-linear_ref = nn.Linear(in_features, out_features, bias=False, device='cuda:2')
-with torch.no_grad():
-    linear_ref.weight = nn.Parameter(weight_ref)
-    res_ref = linear_ref(x)
-    print(linear_ref.weight.shape)
-    print(f'nn.linear.ref_res: {res_ref}, {res_ref.shape}')
+# # weight_awq = dequantize(qweight_ref, qzeros_ref, scales_ref, group_size_awq)
+# print(f'-- dequantization: weight_ref.shape={weight_ref.shape}, weight_ref: \n{weight_ref}')
+# linear_ref = nn.Linear(in_features, out_features, bias=False, device='cuda:0')
+# with torch.no_grad():
+#     linear_ref.weight = nn.Parameter(weight_ref)
+#     res_ref = linear_ref(x)
+#     print(linear_ref.weight.shape)
+#     print(f'nn.linear.ref_res: {res_ref}, {res_ref.shape}')
 
 
 def load_weight(path):
@@ -65,7 +68,7 @@ def load_weight(path):
             'weight_scale_2']
     tensors = {}
 
-    with safe_open(file_path, framework="pt", device="cuda:2") as f:
+    with safe_open(file_path, framework="pt", device="cuda:0") as f:
         for key in keys:
             tensor = f.get_tensor(prefix + key)
             tensors[key] = tensor
@@ -136,7 +139,7 @@ def dequantize_x(x, x_block_scale, x_global_scale, group_size):
     return x.half()
 
 
-sorted_candidates = torch.tensor([0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32).to("cuda:2")
+sorted_candidates = torch.tensor([0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32).to("cuda:0")
 
 def quantize_to_fp4_e2m1(x : torch.Tensor, x_global_scale, group_size):
     org_shape = x.shape
@@ -179,48 +182,95 @@ def quantize_to_fp4_e2m1(x : torch.Tensor, x_global_scale, group_size):
     return x_fp4, x_block_scale
 
 
-tensors = load_weight('/root/turbomind/model-00001-of-00080.safetensors')
-input_global_scale = tensors['input_scale']
-weight_fp4 = tensors['weight']
-weight_block_scale = tensors['weight_scale']
-weight_global_scale = tensors['weight_scale_2']
+# tensors = load_weight('/root/turbomind/model-00001-of-00080.safetensors')
+# input_global_scale = tensors['input_scale']
+# weight_fp4 = tensors['weight']
+# weight_block_scale = tensors['weight_scale']
+# weight_global_scale = tensors['weight_scale_2']
 
-group_size = 16
-batch_size = 16384
-# 7186
-in_features = tensors['weight'].shape[0]
-# 18432
-out_features = tensors['weight'].shape[1]*2
+# group_size = 16
+# batch_size = 16384
+# # 7186
+# in_features = tensors['weight'].shape[0]
+# # 18432
+# out_features = tensors['weight'].shape[1]*2
 
-input = x
-# print(input)
-input_fp4, input_block_scale = quantize_to_fp4_e2m1(input, input_global_scale, group_size)
-# print(input_fp4, input_block_scale)
-input = dequantize_x(input_fp4, input_block_scale, input_global_scale, group_size)
-# print(input)
+# input = x
+# # print(input)
+# input_fp4, input_block_scale = quantize_to_fp4_e2m1(input, input_global_scale, group_size)
+# # print(input_fp4, input_block_scale)
+# input = dequantize_x(input_fp4, input_block_scale, input_global_scale, group_size)
+# # print(input)
 
-weight = dequantize_w(weight_fp4, weight_block_scale, weight_global_scale, group_size)
-print(f'-- dequantization: weight.shape={weight.shape}, weight: \n{weight}')
+# weight = dequantize_w(weight_fp4, weight_block_scale, weight_global_scale, group_size)
+# print(f'-- dequantization: weight.shape={weight.shape}, weight: \n{weight}')
 
-fp4_linear = nn.Linear(out_features, in_features, bias=False, device='cuda:2')
-with torch.no_grad():
-    # print(fp4_linear.weight.shape)
-    fp4_linear.weight = nn.Parameter(weight)
-    # print(fp4_linear.weight.shape)
-    fp4_res = fp4_linear(input)
-    print(f'nn.linear.res: {fp4_res}, {fp4_res.shape}')
+# fp4_linear = nn.Linear(out_features, in_features, bias=False, device='cuda:0')
+# with torch.no_grad():
+#     # print(fp4_linear.weight.shape)
+#     fp4_linear.weight = nn.Parameter(weight)
+#     # print(fp4_linear.weight.shape)
+#     fp4_res = fp4_linear(input)
+#     print(f'nn.linear.res: {fp4_res}, {fp4_res.shape}')
+
+# Used by the (fp16 -> int4) quant layer + int4 gemm network.
+
+def e2m1_and_ufp8_scale_to_float_tensor_v2(
+    e2m1_tensor: torch.Tensor,
+    ufp8_scale_tensor: torch.Tensor,
+    global_scale_tensor: torch.Tensor,
+    sf_vec_size,
+    ufp8_type: int = 1,
+):
+    float_tensor = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+        e2m1_tensor, ufp8_scale_tensor, global_scale_tensor, sf_vec_size,
+        ufp8_type)
+    return float_tensor
 
 
-abs_diff = torch.abs(fp4_res - res_ref).float()
-rel_diff = abs_diff / torch.max(torch.abs(res_ref), torch.abs(fp4_res))
-rtol = 0.01
-atol = 0.0001
-outliers = abs_diff > atol + rtol * torch.abs(res_ref)
-abs_diff = torch.sum(abs_diff) / abs_diff.numel()
-rel_diff = torch.sum(rel_diff) / rel_diff.numel()
-outliers = torch.sum(outliers) / outliers.shape[0]
-print(f'abs_diff {abs_diff:4f}, '
-      f'rel_diff {rel_diff:4f}, '
-      f'outliers {outliers:4f}')
+class TestFunctional(unittest.TestCase):
+    def setUp(self):
+        tensorrt_llm.logger.set_level("warning")
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+    @parameterized.expand(list([[1024, 1024, torch.half, False],
+                            [2, 512, torch.bfloat16, False],
+                            [13, 16, torch.half, True]]))
+    def test_fp4_quantize_torch(self, m, k, dtype, use_ue8m0):
+        a = torch.randn([m, k], dtype=torch.float32).to(dtype).float()
+        a_global_sf = (448 * 6) / a.abs().max().float()
+        sf_vec_size = 16
+
+        a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(
+            a.to(dtype).cuda(), a_global_sf.cuda(), sf_vec_size, use_ue8m0)
+
+        print(unpack_uint8_to_fp4(a_fp4))
+        print(a_sf)
+        a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4.cpu(), a_sf.cpu(),
+                                                        1 / a_global_sf,
+                                                        sf_vec_size)
+        
+        input_fp4, input_block_scale = quantize_to_fp4_e2m1(a.to(dtype).cuda(), (1/a_global_sf).cuda(), sf_vec_size)
+        print(input_fp4, input_block_scale)
+        input = dequantize_x(input_fp4, input_block_scale, (1/a_global_sf).cuda(), sf_vec_size)
+        # my_a_pt = dequantize_w(a_fp4, a_sf, (1 / a_global_sf).cuda(), sf_vec_size)
+
+        torch.cuda.synchronize()
+        if not use_ue8m0:
+            # The gap is too large for ue8m0, so we just make sure that it runs
+            self.assertTrue(torch.allclose(a, input.float().cpu(), atol=1, rtol=1))
+
+
+# abs_diff = torch.abs(fp4_res - res_ref).float()
+# rel_diff = abs_diff / torch.max(torch.abs(res_ref), torch.abs(fp4_res))
+# rtol = 0.01
+# atol = 0.0001
+# outliers = abs_diff > atol + rtol * torch.abs(res_ref)
+# abs_diff = torch.sum(abs_diff) / abs_diff.numel()
+# rel_diff = torch.sum(rel_diff) / rel_diff.numel()
+# outliers = torch.sum(outliers) / outliers.shape[0]
+# print(f'abs_diff {abs_diff:4f}, '
+#       f'rel_diff {rel_diff:4f}, '
+#       f'outliers {outliers:4f}')
 
 # abs_diff 0.004328, rel_diff 0.239396, outliers 6722.556641
