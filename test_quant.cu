@@ -82,11 +82,14 @@ __global__ void compare_fp4_bits(const __half* input,
     __nv_fp4_e2m1 q_intrinsic = __nv_fp4_e2m1(__float2half_rn(x_scaled));
 
     // 将 FP4 值按比特存储到结果中
-    int byte_idx = idx / 2;
-    int shift = (idx % 2) * 4;
+    // int byte_idx = idx / 2;
+    // int shift = (idx % 2) * 4;
     // printf("hello %d ", idx);
-    lookup_result[byte_idx] |= (static_cast<uint8_t>(q_lookup) & 0xF) << shift;
-    intrinsic_result[byte_idx] |= (static_cast<uint8_t>(q_intrinsic) & 0xF) << shift;
+    // lookup_result[byte_idx] |= (static_cast<uint8_t>(q_lookup) & 0xF) << shift;
+    lookup_result[idx] |= static_cast<uint8_t>(q_lookup.__x);
+    // printf("%x\n",q_lookup.__x);
+    // intrinsic_result[byte_idx] |= (static_cast<uint8_t>(q_intrinsic) & 0xF) << shift;
+    intrinsic_result[idx] |= static_cast<uint8_t>(q_intrinsic.__x);
 }
 
 
@@ -132,7 +135,7 @@ void check_bit_errors(const uint8_t* d_lookup,
 
 int main() {
     const int group_size = 16;
-    const int n_groups = 16;
+    const int n_groups = 4;
     const int total_elements = group_size * n_groups;
 
     // 初始化输入数据（正态分布）
@@ -151,16 +154,40 @@ int main() {
         // val = 100;
     }
 
+    h_input = {
+        // 第一行数据
+        __half{1.9268f}, __half{1.4873f}, __half{0.90088f}, __half{-2.1055f},
+        __half{0.67822f}, __half{-1.2344f}, __half{-0.04306f}, __half{-1.6045f},
+        __half{-0.75195f}, __half{1.6484f}, __half{-0.39258f}, __half{-1.4033f},
+        __half{-0.72803f}, __half{-0.55957f}, __half{-0.76904f}, __half{0.76221f},
+        __half{1.6426f}, __half{-0.15955f}, __half{-0.49731f}, __half{0.4397f},
+        __half{-0.7583f}, __half{1.0781f}, __half{0.80078f}, __half{1.6807f},
+        __half{1.2793f}, __half{1.2969f}, __half{0.61035f}, __half{1.335f},
+        __half{-0.23157f}, __half{0.041748f}, __half{-0.25146f}, __half{0.85986f},
+    
+        // 第二行数据
+        __half{-1.3848f}, __half{-0.87109f}, __half{-0.22339f}, __half{1.7178f},
+        __half{0.31885f}, __half{-0.42456f}, __half{0.30566f}, __half{-0.77441f},
+        __half{-1.5576f}, __half{0.99561f}, __half{-0.87988f}, __half{-0.60107f},
+        __half{-1.2744f}, __half{2.123f}, __half{-1.2344f}, __half{-0.48779f},
+        __half{-0.91406f}, __half{-0.6582f}, __half{0.078003f}, __half{0.52588f},
+        __half{-0.48804f}, __half{1.1914f}, __half{-0.81396f}, __half{-0.73584f},
+        __half{-1.4033f}, __half{0.036011f}, __half{-0.063477f}, __half{0.67578f},
+        __half{-0.097778f}, __half{1.8447f}, __half{-1.1846f}, __half{1.3838f},
+
+    };
+
     __half* d_input;
     float* d_max_vals;
     uint8_t* d_lookup_result, *d_intrinsic_result;
+
     cudaMalloc(&d_input, total_elements * sizeof(__half));
     cudaMalloc(&d_max_vals, n_groups * sizeof(float));
-    cudaMalloc(&d_lookup_result, total_elements / 2);
-    cudaMalloc(&d_intrinsic_result, total_elements / 2);
+    cudaMalloc(&d_lookup_result, total_elements);
+    cudaMalloc(&d_intrinsic_result, total_elements);
     
-    cudaMemset(d_lookup_result, 0, total_elements / 2);
-    cudaMemset(d_intrinsic_result, 0, total_elements / 2);
+    cudaMemset(d_lookup_result, 0, total_elements);
+    cudaMemset(d_intrinsic_result, 0, total_elements);
 
     cudaMemcpy(d_input, h_input.data(), total_elements * sizeof(__half), cudaMemcpyHostToDevice);
 
@@ -194,40 +221,16 @@ int main() {
 }
 
 // === h_lookup (查表法) ===
-// 00 00 03 04 03 03 00 06 
-// 06 00 06 00 00 00 00 00 
-// 03 00 01 04 02 00 00 02 
-// 02 01 03 00 00 04 04 00 
-// 03 00 00 01 00 00 00 04 
-// 00 04 00 00 01 00 00 00 
-// 03 00 03 00 00 00 00 00 
-// 00 00 02 00 00 00 04 00 
-// 00 00 00 00 00 00 03 00 
-// 00 00 00 04 01 06 00 01 
-// 02 01 00 00 06 00 00 00 
-// 00 02 00 00 01 00 00 00 
-// 03 00 00 00 00 00 00 02 
-// 00 04 04 00 06 00 00 00 
-// 02 00 01 00 00 03 06 00 
-// 00 00 00 06 06 02 01 00 
+// 07 06 05 0F 04 0E 08 0E 
+// 0C 06 0A 0E 0C 0B 0C 04 
+// 07 09 0C 03 0D 06 05 07 
+// 06 06 04 06 0A 00 0A 05 
 
 
 // === h_intrinsic (Intrinsic法) ===
-// 00 00 03 04 03 03 00 06 
-// 06 00 06 00 00 00 00 00 
-// 03 00 01 04 02 00 00 02 
-// 02 01 03 00 00 04 04 00 
-// 03 00 00 01 00 00 00 04 
-// 00 04 00 00 01 00 00 00 
-// 03 00 03 00 00 00 00 00 
-// 00 00 02 00 00 00 04 00 
-// 00 00 00 00 00 00 03 00 
-// 00 00 00 04 01 06 00 01 
-// 02 01 00 00 06 00 00 00 
-// 00 02 00 00 01 00 00 00 
-// 03 00 00 00 00 00 00 02 
-// 00 04 04 00 06 00 00 00 
-// 02 00 01 00 00 03 06 00 
-// 00 00 00 06 06 02 01 00 
+// 07 06 05 0F 04 0E 08 0E 
+// 0C 06 0A 0E 0C 0B 0C 04 
+// 07 09 0C 03 0D 06 05 07 
+// 06 06 04 06 0A 00 0A 05 
 
-// Bit-level errors: 0/256 (0.00%)
+// Bit-level errors: 0/64 (0.00%)
