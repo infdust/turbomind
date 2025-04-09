@@ -4,6 +4,9 @@ from safetensors import safe_open
 import tensorrt_llm
 import unittest
 from parameterized import parameterized
+from tensorrt_llm import Tensor
+import tensorrt as trt
+
 
 torch.manual_seed(0)
 
@@ -102,10 +105,10 @@ def unpack_uint8_to_fp4(x: torch.Tensor) -> torch.Tensor:
     
     val = val * torch.where(s > 0.5, -1.0, 1.0)
     
-    val_fp8 = val.to(torch.float8_e4m3fn)
-    val_fp8 = val_fp8.view(original_shape)
+    val_fp16 = val.to(torch.half)
+    val_fp16 = val_fp16.view(original_shape)
     
-    return val_fp8
+    return val_fp16
 
 
 def dequantize_w(w, w_block_scale, w_global_scale, group_size):
@@ -139,9 +142,11 @@ def dequantize_x(x, x_block_scale, x_global_scale, group_size):
     return x
 
 
-sorted_candidates = torch.tensor([0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32).to("cuda:0")
+sorted_candidates = torch.tensor([0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float).to("cuda:0")
 
 def quantize_to_fp4_e2m1(x : torch.Tensor, x_global_scale, group_size):
+    x = x.float()
+    # print(x)
     org_shape = x.shape
     # [n_group, group_size]
     x = x.reshape(-1, group_size)
@@ -150,7 +155,10 @@ def quantize_to_fp4_e2m1(x : torch.Tensor, x_global_scale, group_size):
     max_val = max_val.clamp(min=1e-5)
 
     x_block_scale = max_val / 6.0
-    x_fp4 = x / x_block_scale
+    x_block_scale = torch.clamp((x_block_scale / x_global_scale), -448.0, 448.0).to(torch.float8_e4m3fn)
+
+    x_fp4 = x / (x_block_scale.float() * x_global_scale)
+    print(x_fp4.reshape(org_shape))
     # 计算绝对值
     abs_x = torch.abs(x_fp4)
     # 找到插入位置
@@ -174,7 +182,7 @@ def quantize_to_fp4_e2m1(x : torch.Tensor, x_global_scale, group_size):
     # 应用符号
     x_fp4 = selected_val * torch.sign(x_fp4)
     # use global_scale to quantize block_scale
-    x_block_scale = torch.clamp((x_block_scale / x_global_scale), -448.0, 448.0).to(torch.float8_e4m3fn)
+    # x_block_scale = torch.clamp((x_block_scale / x_global_scale), -448.0, 448.0).to(torch.float8_e4m3fn)
     # [ci, co/group_size]
     x_block_scale = x_block_scale.view(org_shape[0], -1)
 
@@ -230,7 +238,19 @@ def e2m1_and_ufp8_scale_to_float_tensor_v2(
         e2m1_tensor, ufp8_scale_tensor, global_scale_tensor, sf_vec_size,
         ufp8_type)
     return float_tensor
-
+def float_tensor_to_e2m1_and_ufp8_scale(float_tensor: torch.Tensor,
+                                        sf_vec_size,
+                                        ufp8_type: int = 1):
+    value_e2m1, scale_ufp8, rep_float = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+        float_tensor, sf_vec_size, ufp8_type)
+    return value_e2m1, scale_ufp8, rep_float
+def half_tensor_to_e2m1_and_ufp8_scale(half_tensor: torch.Tensor,
+                                       sf_scale_tensor: torch.Tensor,
+                                       sf_vec_size,
+                                       ufp8_type: int = 1):
+    value_e2m1, scale_ufp8 = torch.ops.tensorrt_llm.half_to_e2m1_and_ufp8sf_scale(
+        half_tensor, sf_scale_tensor, sf_vec_size, ufp8_type)
+    return value_e2m1, scale_ufp8
 
 class TestFunctional(unittest.TestCase):
     def setUp(self):
@@ -280,16 +300,20 @@ class TestFunctional(unittest.TestCase):
         ab_global_sf = 1 / (a_global_sf * b_global_sf)
         ab_global_sf = ab_global_sf.cuda()
         sf_vec_size = 16
+        # print(a.half())
         a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a.half().cuda(),
                                                     a_global_sf.cuda(),
                                                     sf_vec_size, False)
-        print(unpack_uint8_to_fp4(a_fp4).shape)
-        # torch.Size([1024, 1024])
-        print(a_sf.shape)
-        # torch.Size([65536])
-        print(a_sf)
-        # tensor([116, 114, 116,  ..., 115, 111, 115], device='cuda:0',
-        # dtype=torch.uint8)
+        # print(a_fp4)
+        # print(unpack_uint8_to_fp4(a_fp4))
+        # ref_gemm_input_e2m1, ref_gemm_input_ufp8_scale = half_tensor_to_e2m1_and_ufp8_scale(
+        #     a.half().cuda(), a_global_sf.cuda(), sf_vec_size)
+        # print(unpack_uint8_to_fp4(ref_gemm_input_e2m1))
+        # print(ref_gemm_input_ufp8_scale)
+        # print(unpack_uint8_to_fp4(a_fp4).dtype)
+        # print(unpack_uint8_to_fp4(a_fp4).shape)
+        # print(a_sf.shape)
+        # print(a_sf)
         b_fp4, b_sf = torch.ops.trtllm.fp4_quantize(b.half().cuda(),
                                                     b_global_sf.cuda(),
                                                     sf_vec_size, False)
@@ -304,19 +328,8 @@ class TestFunctional(unittest.TestCase):
         # c = (torch.ops.trtllm.fp4_gemm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
         #                                False).float().cpu())
         my_a_fp4, my_a_sf = quantize_to_fp4_e2m1(a.half().cuda(), (1/a_global_sf).cuda(), sf_vec_size)
-        print(my_a_fp4.shape)
-        # torch.Size([1024, 1024])
-        print(my_a_sf.shape)
-        # torch.Size([1024, 64])
-        print(my_a_sf)
-        # tensor([[192., 160., 192.,  ..., 256., 192., 144.],
-        # [160., 192., 240.,  ..., 120., 192., 176.],
-        # [144., 192., 176.,  ..., 192., 208., 224.],
-        # ...,
-        # [192., 240., 176.,  ..., 176., 144., 256.],
-        # [288., 176., 192.,  ..., 192., 112., 120.],
-        # [192., 208., 240.,  ..., 176., 120., 176.]], device='cuda:0',
-        # dtype=torch.float8_e4m3fn)
+        # print(unpack_uint8_to_fp4(a_fp4).half() - my_a_fp4)
+        # print(my_a_fp4)
         my_b_fp4, my_b_sf = quantize_to_fp4_e2m1(b.half().cuda(), (1/b_global_sf).cuda(), sf_vec_size)        
         # print(my_a_fp4)
         # print(unpack_uint8_to_fp4(a_fp4).float())
@@ -326,10 +339,11 @@ class TestFunctional(unittest.TestCase):
         # abs_diff = torch.sum(abs_diff) / abs_diff.numel()
         # rel_diff = torch.sum(rel_diff) / rel_diff.numel()
         my_a = dequantize_x(my_a_fp4, my_a_sf, (1/a_global_sf).cuda(), sf_vec_size)
+        # print(a_pt - my_a.cpu())
         my_b = dequantize_x(my_b_fp4, my_b_sf, (1/b_global_sf).cuda(), sf_vec_size)
         # print(my_a.float())
-        torch.cuda.synchronize()
-        c = torch.nn.functional.linear(a, b)
+        # torch.cuda.synchronize()
+        # c = torch.nn.functional.linear(a, b)
         c_pt = torch.nn.functional.linear(a_pt, b_pt)
         my_c = torch.nn.functional.linear(my_a.float(), my_b.float())
         my_c = my_c.cpu()
@@ -342,9 +356,12 @@ class TestFunctional(unittest.TestCase):
         # print(c)
         # print(c_pt)
         # print(my_c)
-        # print(abs_diff)
-        # print(rel_diff)
-        # print(calc_diff(my_c, c))
+        print(abs_diff)
+        print(rel_diff)
+        print(calc_diff(my_c, c_pt))
+        # tensor(0.0072)
+        # tensor(0.0015)
+        # tensor(3.9849e-08, dtype=torch.float64)
 
         # diff of a_fp4 and my_a_fp4: tensor(0.0449) tensor(0.0163)
 
