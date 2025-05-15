@@ -1,22 +1,9 @@
 import torch
-import torch.nn as nn
-from safetensors import safe_open
+# from safetensors import safe_open
 import tensorrt_llm
 import unittest
 from parameterized import parameterized
-from tensorrt_llm import Tensor
-import tensorrt as trt
-
-def load_specified_linear_weights(path, layer_id=0, layer="mlp.down_proj"):
-    layer_id = 0
-    prefix = f'model.layers.{layer_id}.{layer}.'
-    keys = ['weight', 'weight_scale_inv']
-    tensors = {}
-    with safe_open(path, framework='pt', device='cuda:0') as f:
-        for key in keys:
-            tensors[key] = f.get_tensor(prefix + key)
-
-    return tensors['weight'], tensors['weight_scale_inv']
+# import tensorrt as trt
 
 def unpack_uint8_to_fp4(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.uint8, "Input tensor must be of type torch.uint8"
@@ -143,19 +130,6 @@ def e2m1_and_ufp8_scale_to_float_tensor_v2(
         e2m1_tensor, ufp8_scale_tensor, global_scale_tensor, sf_vec_size,
         ufp8_type)
     return float_tensor
-def float_tensor_to_e2m1_and_ufp8_scale(float_tensor: torch.Tensor,
-                                        sf_vec_size,
-                                        ufp8_type: int = 1):
-    value_e2m1, scale_ufp8, rep_float = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
-        float_tensor, sf_vec_size, ufp8_type)
-    return value_e2m1, scale_ufp8, rep_float
-def half_tensor_to_e2m1_and_ufp8_scale(half_tensor: torch.Tensor,
-                                       sf_scale_tensor: torch.Tensor,
-                                       sf_vec_size,
-                                       ufp8_type: int = 1):
-    value_e2m1, scale_ufp8 = torch.ops.tensorrt_llm.half_to_e2m1_and_ufp8sf_scale(
-        half_tensor, sf_scale_tensor, sf_vec_size, ufp8_type)
-    return value_e2m1, scale_ufp8
 
 class TestFunctional(unittest.TestCase):
     def setUp(self):
@@ -197,8 +171,8 @@ class TestFunctional(unittest.TestCase):
         b = torch.randn([n, k], dtype=torch.float32)
         a_global_sf = (448 * 6) / a.abs().max().float()
         b_global_sf = (448 * 6) / b.abs().max().float()
-        ab_global_sf = 1 / (a_global_sf * b_global_sf)
-        ab_global_sf = ab_global_sf.cuda()
+        # ab_global_sf = 1 / (a_global_sf * b_global_sf)
+        # ab_global_sf = ab_global_sf.cuda()
         sf_vec_size = 16
         # print(a.half())
         a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a.half().cuda(),
