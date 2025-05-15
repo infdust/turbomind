@@ -2,6 +2,12 @@
 
 功能实现在turbomind/fp4_to_bf16.py
 
+运行
+```bash
+python turbomind/fp4_to_bf16.py
+```
+以验证功能
+
 处理三种不同的权重类型：
 * 原始权重(fp16类型，包含一个weight Tensor)
 * 量化权重(fp4类型，包含weight(fp4)和weight_scale(fp8)两个Tensor，以及一个fp32类型的per-tensor global_scale)
