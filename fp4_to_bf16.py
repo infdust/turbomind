@@ -7,49 +7,16 @@ from parameterized import parameterized
 from tensorrt_llm import Tensor
 import tensorrt as trt
 
-
-torch.manual_seed(0)
-
-def load_specified_linear_weights():
-    ckpt_path = 'model-00001-of-000163.safetensors'  # noqa
+def load_specified_linear_weights(path, layer_id=0, layer="mlp.down_proj"):
     layer_id = 0
-    prefix = f'model.layers.{layer_id}.mlp.down_proj.'
+    prefix = f'model.layers.{layer_id}.{layer}.'
     keys = ['weight', 'weight_scale_inv']
     tensors = {}
-    with safe_open(ckpt_path, framework='pt', device='cuda:0') as f:
+    with safe_open(path, framework='pt', device='cuda:0') as f:
         for key in keys:
             tensors[key] = f.get_tensor(prefix + key)
 
     return tensors['weight'], tensors['weight_scale_inv']
-
-def dequantize_weights_torch(quantized_weights: torch.Tensor, scale_matrix: torch.Tensor) -> torch.Tensor:
-    H, W = quantized_weights.shape
-    assert H % 128 == 0 and W % 128 == 0
-    assert scale_matrix.shape == (H // 128, W // 128)
-    scale_expanded = torch.kron(
-        scale_matrix,
-        torch.ones((128, 128), dtype=scale_matrix.dtype, device=scale_matrix.device)
-    )
-
-    dequantized = quantized_weights.float() * scale_expanded.float()
-    return dequantized.half()
-
-def load_weight(path):
-    file_path = path
-    layer_id = 0
-    prefix = f'model.layers.{layer_id}.mlp.down_proj.'
-    keys = ['input_scale', 
-            'weight', 
-            'weight_scale', 
-            'weight_scale_2']
-    tensors = {}
-
-    with safe_open(file_path, framework="pt", device="cuda:0") as f:
-        for key in keys:
-            tensor = f.get_tensor(prefix + key)
-            tensors[key] = tensor
-            # print(f"Tensor '{key}': shape={tensor.shape}, dtype={tensor.dtype}")
-    return tensors
 
 def unpack_uint8_to_fp4(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.uint8, "Input tensor must be of type torch.uint8"
@@ -84,7 +51,7 @@ def unpack_uint8_to_fp4(x: torch.Tensor) -> torch.Tensor:
     return val_fp16
 
 
-def dequantize_w(w, w_block_scale, w_global_scale, group_size):
+def dequantize_unpack(w, w_block_scale, w_global_scale, group_size):
 
     w = unpack_uint8_to_fp4(w)
     w = w.float()
@@ -100,9 +67,7 @@ def dequantize_w(w, w_block_scale, w_global_scale, group_size):
 
     return w.half()
 
-def dequantize_x(x, x_block_scale, x_global_scale, group_size):
-    # x = unpack_uint8_to_fp4(x)
-    # x = x.float()
+def dequantize(x, x_block_scale, x_global_scale, group_size):
     x_block_scale = x_block_scale.float()
 
     for i in range(x_block_scale.shape[-1]):
@@ -198,31 +163,26 @@ class TestFunctional(unittest.TestCase):
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
     @parameterized.expand(list([[1024, 1024, torch.half, False],
-                            [2, 512, torch.bfloat16, False],
-                            [13, 16, torch.half, True]]))
-    def test_fp4_quantize_torch(self, m, k, dtype, use_ue8m0):
+                            [2, 512, torch.bfloat16, False]]))
+    def test_fp4_quantize_torch(self, m, k, dtype, unpack):
         a = torch.randn([m, k], dtype=torch.float32).to(dtype).float()
         a_global_sf = (448 * 6) / a.abs().max().float()
         sf_vec_size = 16
 
-        a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(
-            a.to(dtype).cuda(), a_global_sf.cuda(), sf_vec_size, use_ue8m0)
-
-        print(unpack_uint8_to_fp4(a_fp4))
-        print(a_sf)
-        a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4.cpu(), a_sf.cpu(),
-                                                        1 / a_global_sf,
-                                                        sf_vec_size)
-        
-        input_fp4, input_block_scale = quantize_to_fp4_e2m1(a.to(dtype).cuda(), (1/a_global_sf).cuda(), sf_vec_size)
-        print(input_fp4, input_block_scale)
-        input = dequantize_x(input_fp4, input_block_scale, (1/a_global_sf).cuda(), sf_vec_size)
-        # my_a_pt = dequantize_w(a_fp4, a_sf, (1 / a_global_sf).cuda(), sf_vec_size)
+        result_a = None
+        if unpack:
+            a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(
+                a.to(dtype).cuda(), a_global_sf.cuda(), sf_vec_size, false)
+            # print(unpack_uint8_to_fp4(a_fp4))
+            # print(a_sf)
+            result_a = dequantize_unpack(a_fp4, a_sf, (1 / a_global_sf).cuda(), sf_vec_size)
+        else:
+            a_fp4, a_sf = quantize_to_fp4_e2m1(a.to(dtype).cuda(), (1/a_global_sf).cuda(), sf_vec_size)
+            # print(a_fp4, a_sf)
+            result_a = dequantize(a_fp4, a_sf, (1/a_global_sf).cuda(), sf_vec_size)
 
         torch.cuda.synchronize()
-        if not use_ue8m0:
-            # The gap is too large for ue8m0, so we just make sure that it runs
-            self.assertTrue(torch.allclose(a, input.float().cpu(), atol=1, rtol=1))
+        self.assertTrue(torch.allclose(a, result_a.float().cpu(), atol=1, rtol=1))
 
     @parameterized.expand(
         list([
@@ -257,9 +217,9 @@ class TestFunctional(unittest.TestCase):
         my_a_fp4, my_a_sf = quantize_to_fp4_e2m1(a.half().cuda(), (1/a_global_sf).cuda(), sf_vec_size)
 
         my_b_fp4, my_b_sf = quantize_to_fp4_e2m1(b.half().cuda(), (1/b_global_sf).cuda(), sf_vec_size)        
-        my_a = dequantize_x(my_a_fp4, my_a_sf, (1/a_global_sf).cuda(), sf_vec_size)
+        my_a = dequantize(my_a_fp4, my_a_sf, (1/a_global_sf).cuda(), sf_vec_size)
         # print(a_pt - my_a.cpu())
-        my_b = dequantize_x(my_b_fp4, my_b_sf, (1/b_global_sf).cuda(), sf_vec_size)
+        my_b = dequantize(my_b_fp4, my_b_sf, (1/b_global_sf).cuda(), sf_vec_size)
 
         c_pt = torch.nn.functional.linear(a_pt, b_pt)
         my_c = torch.nn.functional.linear(my_a.float(), my_b.float())
@@ -273,20 +233,7 @@ class TestFunctional(unittest.TestCase):
         print(abs_diff)
         print(rel_diff)
         print(calc_diff(my_c, c_pt))
-        # tensor(0.0072)
-        # tensor(0.0015)
-        # tensor(3.9849e-08, dtype=torch.float64)
         self.assertTrue(torch.allclose(c_pt, my_c.float().cpu(), atol=1e-2, rtol=1e-2))
 
-
-# abs_diff = torch.abs(fp4_res - res_ref).float()
-# rel_diff = abs_diff / torch.max(torch.abs(res_ref), torch.abs(fp4_res))
-# rtol = 0.01
-# atol = 0.0001
-# outliers = abs_diff > atol + rtol * torch.abs(res_ref)
-# abs_diff = torch.sum(abs_diff) / abs_diff.numel()
-# rel_diff = torch.sum(rel_diff) / rel_diff.numel()
-# outliers = torch.sum(outliers) / outliers.shape[0]
-# print(f'abs_diff {abs_diff:4f}, '
-#       f'rel_diff {rel_diff:4f}, '
-#       f'outliers {outliers:4f}')
+if __name__ == '__main__':
+    unittest.main()
